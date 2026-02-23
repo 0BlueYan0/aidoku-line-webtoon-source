@@ -1,0 +1,17 @@
+{
+  "name": "Source List",
+  "sources": [
+    {
+      "id": "zh-hant.webtoons",
+      "name": "Webtoons 繁體中文",
+      "version": 10,
+      "iconURL": "icons/zh-hant.webtoons-v10.png",
+      "downloadURL": "sources/zh-hant.webtoons-v10.aix",
+      "languages": [
+        "zh"
+      ],
+      "contentRating": 0,
+      "baseURL": "https://www.webtoons.com/zh-hant/"
+    }
+  ]
+}
