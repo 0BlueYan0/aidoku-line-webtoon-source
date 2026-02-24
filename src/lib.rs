@@ -16,8 +16,8 @@ const BASE_URL: &str = "https://www.webtoons.com";
 const LANG_PATH: &str = "/zh-hant";
 const USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
-/// Max chapter pages to fetch. Each page has ~10 chapters.
-const MAX_CHAPTER_PAGES: i32 = 9;
+/// Webtoons mobile API base URL for fetching all episodes in one request.
+const MOBILE_API: &str = "https://m.webtoons.com/api/v1/webtoon";
 
 struct WebtoonSource;
 
@@ -178,112 +178,18 @@ impl Source for WebtoonSource {
 		}
 
 		if needs_chapters {
-			let mut chapters: Vec<Chapter> = Vec::new();
-			let mut current_page = 1;
+			// Use Webtoons mobile API to get ALL chapters in one request.
+			// Endpoint: m.webtoons.com/api/v1/webtoon/{titleId}/episodes?pageSize=99999
+			let api_url = format!(
+				"{MOBILE_API}/{title_no}/episodes?pageSize=99999"
+			);
 
-			loop {
-				let page_url = if let Some(ref url) = manga.url {
-					format!("{url}&page={current_page}")
-				} else {
-					format!(
-						"{BASE_URL}{LANG_PATH}/originals/a/list?title_no={title_no}&page={current_page}"
-					)
-				};
+			let body = Request::get(&api_url)?
+				.header("Referer", BASE_URL)
+				.header("User-Agent", USER_AGENT)
+				.string()?;
 
-				// Use match so a timeout breaks gracefully
-				let req = match Request::get(&page_url) {
-					Ok(r) => r.header("Referer", BASE_URL).header("User-Agent", USER_AGENT),
-					Err(_) => break,
-				};
-				let html = match req.html() {
-					Ok(h) => h,
-					Err(_) => break,
-				};
-
-				let mut found_items = false;
-				if let Some(list) = html.select("#_listUl > li > a") {
-					for item in list {
-						if let Some(chapter) = parse_chapter_item(&item) {
-							chapters.push(chapter);
-							found_items = true;
-						}
-					}
-				} else if let Some(list) = html.select("#_listUl li a") {
-					for item in list {
-						if let Some(chapter) = parse_chapter_item(&item) {
-							chapters.push(chapter);
-							found_items = true;
-						}
-					}
-				}
-
-				if !found_items {
-					break;
-				}
-
-				let has_next = html.select_first(".pg_next").is_some();
-				if !has_next {
-					break;
-				}
-
-				current_page += 1;
-
-				if current_page > MAX_CHAPTER_PAGES {
-					break;
-				}
-			}
-
-			// Find max episode number from fetched chapters
-			let mut max_episode: i32 = 0;
-			for ch in chapters.iter() {
-				if let Some(cn) = ch.chapter_number {
-					let ep = cn as i32;
-					if ep > max_episode {
-						max_episode = ep;
-					}
-				}
-			}
-
-			// Generate entries for any older episodes not fetched.
-			// This covers: timeout on page 2+, hitting MAX_CHAPTER_PAGES, etc.
-			if max_episode > 0 {
-				// Build base path from manga URL for viewer URLs
-				let base_path = manga
-					.url
-					.as_ref()
-					.and_then(|url: &String| {
-						let path_start = url.find(LANG_PATH)?;
-						let path = &url[path_start..];
-						let list_pos = path.find("/list")?;
-						Some(String::from(&path[..list_pos + 1]))
-					})
-					.unwrap_or_else(|| format!("{LANG_PATH}/originals/a/"));
-
-				// Collect episode numbers we already have
-				let mut have_eps: Vec<i32> = Vec::new();
-				for ch in chapters.iter() {
-					if let Some(cn) = ch.chapter_number {
-						have_eps.push(cn as i32);
-					}
-				}
-
-				// The smallest episode we fetched tells us where to stop generating
-				let min_fetched = have_eps.iter().copied().min().unwrap_or(1);
-
-				// Generate entries for episodes min_fetched-1 down to 1 (descending)
-				for ep in (1..min_fetched).rev() {
-					let viewer_url = format!(
-						"{BASE_URL}{base_path}e/viewer?title_no={title_no}&episode_no={ep}"
-					);
-					chapters.push(Chapter {
-						key: viewer_url.clone(),
-						title: Some(format!("第{ep}話")),
-						chapter_number: Some(ep as f32),
-						url: Some(viewer_url),
-						..Default::default()
-					});
-				}
-			}
+			let chapters = parse_episodes_json(&body);
 
 			manga.chapters = Some(chapters);
 		}
