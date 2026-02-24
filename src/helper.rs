@@ -42,15 +42,6 @@ pub fn extract_title_no(url: &str) -> Option<String> {
 	Some(String::from(&rest[..end]))
 }
 
-/// Extract `episode_no` from a Webtoons viewer URL.
-pub fn extract_episode_no(url: &str) -> Option<String> {
-	let pos = url.find("episode_no=")?;
-	let start = pos + 11;
-	let rest = &url[start..];
-	let end = rest.find('&').unwrap_or(rest.len());
-	Some(String::from(&rest[..end]))
-}
-
 /// Parse a manga item from listing/genre/search pages.
 ///
 /// Expected HTML structure:
@@ -118,113 +109,123 @@ pub fn parse_manga_item(item: &Element) -> Option<Manga> {
 	Some(manga)
 }
 
-/// Parse a chapter item from the manga detail page.
-///
-/// Expected HTML structure:
-/// ```html
-/// <li>
-///   <a href=".../viewer?title_no=2089&episode_no=1">
-///     <img src="..." />
-///     <span class="subj"><span>1. Title</span></span>
-///     <span class="date">2026年2月22日</span>
-///   </a>
-/// </li>
+
+
+// --- Mobile API JSON parsing ---
+
+const BASE_URL_HELPER: &str = "https://www.webtoons.com";
+const THUMB_CDN_HELPER: &str = "https://webtoon-phinf.pstatic.net";
+
+/// Extract a JSON string value for a given key from a JSON object substring.
+/// Looks for `"key":"value"` and returns the value.
+fn json_str_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+	let search = aidoku::alloc::format!("\"{}\":\"", key);
+	let pos = json.find(&search)?;
+	let start = pos + search.len();
+	let rest = &json[start..];
+	let end = rest.find('"')?;
+	Some(&rest[..end])
+}
+
+/// Extract a JSON number value for a given key from a JSON object substring.
+fn json_num_value(json: &str, key: &str) -> Option<i64> {
+	let search = aidoku::alloc::format!("\"{}\":", key);
+	let pos = json.find(&search)?;
+	let start = pos + search.len();
+	let rest = &json[start..];
+
+	let mut num_str = String::new();
+	for ch in rest.chars() {
+		if ch.is_ascii_digit() || ch == '-' {
+			num_str.push(ch);
+		} else if !num_str.is_empty() {
+			break;
+		}
+	}
+
+	num_str.parse::<i64>().ok()
+}
+
+/// Parse the Webtoons mobile API JSON response into a list of Chapter objects.
+/// The JSON format is:
+/// ```json
+/// {"result":{"episodeList":[{"episodeNo":1,"episodeTitle":"...","viewerLink":"...","thumbnail":"...","exposureDateMillis":123456},...]},"success":true}
 /// ```
-pub fn parse_chapter_item(item: &Element) -> Option<Chapter> {
-	let href = item.attr("href")?;
+pub fn parse_episodes_json(body: &str) -> Vec<Chapter> {
+	let mut chapters: Vec<Chapter> = Vec::new();
 
-	let episode_no = extract_episode_no(&href);
+	// Find the episodeList array
+	let list_start = match body.find("\"episodeList\":[") {
+		Some(pos) => pos + 14, // skip past "episodeList":[
+		None => return chapters,
+	};
 
-	// Title: span.subj span or .subj span
-	let title = item
-		.select_first(".subj span")
-		.and_then(|el: Element| el.text())
-		.or_else(|| {
-			item.select_first(".subj")
-				.and_then(|el: Element| el.text())
-		});
+	let body_from_list = &body[list_start..];
 
-	let chapter_num = episode_no
-		.as_ref()
-		.and_then(|ep: &String| ep.parse::<f32>().ok());
+	// Split by each episode object: find each {...} block
+	let mut depth = 0;
+	let mut obj_start: Option<usize> = None;
 
-	let date_str = item
-		.select_first(".date")
-		.and_then(|el: Element| el.text());
+	for (i, ch) in body_from_list.char_indices() {
+		match ch {
+			'{' => {
+				if depth == 0 {
+					obj_start = Some(i);
+				}
+				depth += 1;
+			}
+			'}' => {
+				depth -= 1;
+				if depth == 0 {
+					if let Some(start) = obj_start {
+						let obj_str = &body_from_list[start..=i];
+						if let Some(chapter) = parse_single_episode(obj_str) {
+							chapters.push(chapter);
+						}
+					}
+					obj_start = None;
+				}
+			}
+			']' if depth == 0 => break,
+			_ => {}
+		}
+	}
 
-	let date_uploaded = date_str.and_then(|d: String| parse_date(&d));
+	// API returns oldest first; reverse to show newest first
+	chapters.reverse();
+	chapters
+}
 
-	let thumbnail = item
-		.select_first("img")
-		.and_then(|el: Element| el.attr("src"));
+fn parse_single_episode(obj: &str) -> Option<Chapter> {
+	let episode_no = json_num_value(obj, "episodeNo")? as i32;
+	let title = json_str_value(obj, "episodeTitle")
+		.map(|s: &str| String::from(s));
+	let viewer_link = json_str_value(obj, "viewerLink");
+	let thumb_path = json_str_value(obj, "thumbnail");
+	let date_millis = json_num_value(obj, "exposureDateMillis");
 
-	// Check if chapter is locked (paid/premium content)
-	let locked = item.select_first(".ico_lock").is_some()
-		|| item.select_first(".ico_bgm").is_some();
+	// Unescape URL-encoded paths (the JSON has already-encoded URLs)
+	let viewer_url = viewer_link.map(|link: &str| {
+		aidoku::alloc::format!("{BASE_URL_HELPER}{link}")
+	});
+
+	let thumbnail = thumb_path.map(|path: &str| {
+		aidoku::alloc::format!("{THUMB_CDN_HELPER}{path}")
+	});
+
+	let date_uploaded = date_millis.map(|ms: i64| ms / 1000);
+
+	let key = viewer_url
+		.clone()
+		.unwrap_or_else(|| aidoku::alloc::format!("{episode_no}"));
 
 	Some(Chapter {
-		key: href.clone(),
+		key,
 		title,
-		chapter_number: chapter_num,
+		chapter_number: Some(episode_no as f32),
 		date_uploaded,
-		url: Some(href),
+		url: viewer_url,
 		thumbnail,
-		locked,
 		..Default::default()
 	})
-}
-
-/// Parse a Webtoons date string like "2026年2月22日" into a Unix timestamp.
-pub fn parse_date(date_str: &str) -> Option<i64> {
-	let mut year: i64 = 0;
-	let mut month: i64 = 0;
-	let mut day: i64 = 0;
-
-	let mut num_buf = String::new();
-	let mut state = 0;
-
-	for ch in date_str.chars() {
-		if ch.is_ascii_digit() {
-			num_buf.push(ch);
-		} else if ch == '年' && state == 0 {
-			year = num_buf.parse().unwrap_or(0);
-			num_buf.clear();
-			state = 1;
-		} else if ch == '月' && state == 1 {
-			month = num_buf.parse().unwrap_or(0);
-			num_buf.clear();
-			state = 2;
-		} else if ch == '日' && state == 2 {
-			day = num_buf.parse().unwrap_or(0);
-			num_buf.clear();
-		}
-	}
-
-	if year == 0 || month == 0 || day == 0 {
-		return None;
-	}
-
-	let mut days: i64 = 0;
-	for y in 1970..year {
-		days += if is_leap_year(y) { 366 } else { 365 };
-	}
-
-	let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-	for m in 1..month {
-		let idx = (m - 1) as usize;
-		if idx < 12 {
-			days += month_days[idx];
-			if m == 2 && is_leap_year(year) {
-				days += 1;
-			}
-		}
-	}
-
-	days += day - 1;
-
-	Some(days * 86400)
-}
-
-fn is_leap_year(year: i64) -> bool {
-	(year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
